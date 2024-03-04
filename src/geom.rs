@@ -68,3 +68,14 @@ impl Vec2 {
         self.x * self.x + self.y * self.y
     }
 }
+impl std::ops::Add<Vec2> for Rect {
+    type Output = Rect;
+
+    fn add(self, rhs: Vec2) -> Self::Output {
+        Self::Output {
+            x: self.x + rhs.x,
+            y: self.y + rhs.y,
+            ..self
+        }
+    }
+}

@@ -2,14 +2,14 @@ use assets_manager::{asset::Png, AssetCache};
 use frenderer::{
     input::{Input, Key},
     sprites::{Camera2D, SheetRegion, Transform},
-    wgpu, Renderer,
+    wgpu, Immediate,
 };
 use rand::Rng;
 mod geom;
 mod grid;
 use geom::*;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum EntityType {
     Player,
     Enemy,
@@ -48,7 +48,7 @@ const PLAYER_ATK: [SheetRegion; 4] = [
 ];
 const ENEMY: [SheetRegion; 4] = [
     SheetRegion::rect(533 + 16 * 2, 39, 16, 16),
-    SheetRegion::rect(533 + 16 * 1, 39, 16, 16),
+    SheetRegion::rect(533 + 16, 39, 16, 16),
     SheetRegion::rect(533, 39, 16, 16),
     SheetRegion::rect(533 + 16 * 3, 39, 16, 16),
 ];
@@ -65,18 +65,46 @@ impl Dir {
         }
     }
 }
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Pos {
+#[derive(Clone, Debug)]
+struct Entity {
     pos: Vec2,
     dir: Dir,
+    etype: EntityType,
+}
+impl Entity {
+    pub fn rect(&self) -> Rect {
+        Rect {
+            x: self.pos.x - TILE_SZ as f32 / 2.0 + 2.0,
+            y: self.pos.y - TILE_SZ as f32 / 2.0 + 2.0,
+            w: TILE_SZ as u16 - 4,
+            h: TILE_SZ as u16 - 4,
+        }
+    }
+    pub fn transform(&self) -> Transform {
+        Transform {
+            x: self.pos.x,
+            y: self.pos.y,
+            w: TILE_SZ as u16,
+            h: TILE_SZ as u16,
+            rot: 0.0,
+        }
+    }
+    pub fn uv(&self) -> SheetRegion {
+        match self.etype {
+            EntityType::Player => PLAYER[self.dir as usize],
+            EntityType::Enemy => ENEMY[self.dir as usize],
+            _ => panic!("can't draw doors"),
+        }
+        .with_depth(1)
+    }
 }
 mod level;
 use level::Level;
 struct Game {
+    assets: AssetCache,
     current_level: usize,
     levels: Vec<Level>,
-    enemies: Vec<Pos>,
-    player: Pos,
+    entities: Vec<Entity>,
     attack_area: Rect,
     attack_timer: f32,
     knockback_timer: f32,
@@ -119,8 +147,9 @@ fn main() {
     let mut now = frenderer::clock::Instant::now();
     let mut acc = 0.0;
     drv.run_event_loop::<(), _>(
-        move |window, mut frend| {
-            let game = Game::new(&mut frend, &cache);
+        move |window, frend| {
+            let mut frend = Immediate::new(frend);
+            let game = Game::new(&mut frend, cache);
             (window, game, frend)
         },
         move |event, target, (window, ref mut game, ref mut frend)| {
@@ -136,7 +165,7 @@ fn main() {
                     event: WindowEvent::Resized(size),
                     ..
                 } => {
-                    if !frend.gpu.is_web() {
+                    if !frend.gpu().is_web() {
                         frend.resize_surface(size.width, size.height);
                     }
                     window.request_redraw();
@@ -171,7 +200,7 @@ fn main() {
 }
 
 impl Game {
-    fn new(renderer: &mut Renderer, cache: &AssetCache) -> Self {
+    fn new(renderer: &mut Immediate, cache: AssetCache) -> Self {
         let tile_handle = cache
             .load::<Png>("texture")
             .expect("Couldn't load tilesheet img");
@@ -182,20 +211,12 @@ impl Game {
             tile_img.dimensions(),
             Some("tiles-sprites"),
         );
-        let levels = vec![
-            Level::from_str(
-                &cache
-                    .load::<String>("level1")
-                    .expect("Couldn't access level1.txt")
-                    .read(),
-            ),
-            Level::from_str(
-                &cache
-                    .load::<String>("level2")
-                    .expect("Couldn't access level2.txt")
-                    .read(),
-            ),
-        ];
+        let levels = vec![Level::from_str(
+            &cache
+                .load::<String>("level1")
+                .expect("Couldn't access level1.txt")
+                .read(),
+        )];
         let current_level = 0;
         let camera = Camera2D {
             screen_pos: [0.0, 0.0],
@@ -216,6 +237,7 @@ impl Game {
             .map(|(_, ploc)| ploc)
             .expect("Start level doesn't put the player anywhere");
         let mut game = Game {
+            assets: cache,
             current_level,
             attack_area: Rect {
                 x: 0.0,
@@ -227,11 +249,11 @@ impl Game {
             attack_timer: 0.0,
             levels,
             health: 3,
-            enemies: vec![],
-            player: Pos {
+            entities: vec![Entity {
+                etype: EntityType::Player,
                 pos: player_start,
                 dir: Dir::S,
-            },
+            }],
         };
         game.enter_level(player_start);
         game
@@ -240,71 +262,44 @@ impl Game {
         &self.levels[self.current_level]
     }
     fn enter_level(&mut self, player_pos: Vec2) {
-        self.enemies.clear();
-        self.player.pos = player_pos;
+        self.entities.truncate(1);
+        self.entities[0].pos = player_pos;
         for (etype, pos) in self.levels[self.current_level].starts().iter() {
             match etype {
                 EntityType::Player => {}
-                EntityType::Door(_rm, _x, _y) => {}
-                EntityType::Enemy => self.enemies.push(Pos {
+                EntityType::Door(_rm, _x, _y) => todo!("doors not supported"),
+                EntityType::Enemy => self.entities.push(Entity {
                     pos: *pos,
                     dir: Dir::S,
+                    etype: etype.clone(),
                 }),
             }
         }
     }
-    fn sprite_count(&self) -> usize {
-        //todo!("count how many entities and other sprites we have");
-        self.level().sprite_count() + self.enemies.len() + 1 + 1 + 3 //+ player + sword + hearts
-    }
-    fn render(&mut self, frend: &mut Renderer) {
-        // make this exactly as big as we need
-        frend.sprite_group_resize(0, self.sprite_count());
-
-        let sprites_used = self.level().render_into(frend, 0);
-        let (sprite_posns, sprite_gfx) = frend.sprites_mut(0, sprites_used..);
-
-        for (enemy, (trf, uv)) in self
-            .enemies
-            .iter()
-            .zip(sprite_posns.iter_mut().zip(sprite_gfx.iter_mut()))
-        {
-            *trf = Transform {
-                w: TILE_SZ as u16,
-                h: TILE_SZ as u16,
-                x: enemy.pos.x,
-                y: enemy.pos.y,
-                rot: 0.0,
-            };
-            *uv = ENEMY[enemy.dir as usize];
+    fn render(&mut self, frend: &mut Immediate) {
+        self.level().render_immediate(frend);
+        for entity in self.entities.iter() {
+            frend.draw_sprite(0, entity.transform(), entity.uv());
         }
-        let sprite_posns = &mut sprite_posns[self.enemies.len()..];
-        let sprite_gfx = &mut sprite_gfx[self.enemies.len()..];
-        sprite_posns[0] = Transform {
-            w: TILE_SZ as u16,
-            h: TILE_SZ as u16,
-            x: self.player.pos.x,
-            y: self.player.pos.y,
-            rot: 0.0,
-        };
-        sprite_gfx[0] = PLAYER[self.player.dir as usize].with_depth(1);
-        if self.attack_area.is_empty() {
-            sprite_posns[1] = Transform::ZERO;
-        } else {
-            let (w, h) = match self.player.dir {
+        if !self.attack_area.is_empty() {
+            let (w, h) = match self.entities[0].dir {
                 Dir::N | Dir::S => (16, 8),
                 _ => (8, 16),
             };
-            let delta = self.player.dir.to_vec2() * 7.0;
-            sprite_posns[1] = Transform {
-                w,
-                h,
-                x: self.player.pos.x + delta.x,
-                y: self.player.pos.y + delta.y,
-                rot: 0.0,
-            };
+            let delta = self.entities[0].dir.to_vec2() * 7.0;
+            let pos = self.entities[0].pos + delta;
+            frend.draw_sprite(
+                0,
+                Transform {
+                    w,
+                    h,
+                    x: pos.x,
+                    y: pos.y,
+                    rot: 0.0,
+                },
+                PLAYER_ATK[self.entities[0].dir as usize].with_depth(0),
+            );
         }
-        sprite_gfx[1] = PLAYER_ATK[self.player.dir as usize].with_depth(0);
         // TODO POINT: draw hearts
     }
     fn simulate(&mut self, input: &Input, dt: f32) {
@@ -320,35 +315,32 @@ impl Game {
         let attacking = !self.attack_area.is_empty();
         let knockback = self.knockback_timer > 0.0;
         if attacking {
-            // while attacking we can't move
             dx = 0.0;
             dy = 0.0;
         } else if knockback {
-            // during knockback we move but don't turn around
-            let delta = self.player.dir.to_vec2();
+            let delta = self.entities[0].dir.to_vec2();
             dx = -delta.x * KNOCKBACK_SPEED * dt;
             dy = -delta.y * KNOCKBACK_SPEED * dt;
         } else {
-            // not attacking, no knockback, do normal movement
             if dx > 0.0 {
-                self.player.dir = Dir::E;
+                self.entities[0].dir = Dir::E;
             }
             if dx < 0.0 {
-                self.player.dir = Dir::W;
+                self.entities[0].dir = Dir::W;
             }
             if dy > 0.0 {
-                self.player.dir = Dir::N;
+                self.entities[0].dir = Dir::N;
             }
             if dy < 0.0 {
-                self.player.dir = Dir::S;
+                self.entities[0].dir = Dir::S;
             }
         }
         if self.attack_timer <= 0.0 && input.is_key_pressed(Key::Space) {
             // TODO POINT: compute the attack area's center based on the player's position and facing and some offset
             // For the spritesheet provided, the attack is placed 8px "forwards" from the player.
+            self.attack_area = todo!();
             self.attack_timer = ATTACK_MAX_TIME;
         } else if self.attack_timer <= ATTACK_COOLDOWN_TIME {
-            // "turn off" the attack, but the cooldown is still going
             self.attack_area = Rect {
                 x: 0.0,
                 y: 0.0,
@@ -356,10 +348,10 @@ impl Game {
                 h: 0,
             };
         }
-        let dest = self.player.pos + Vec2 { x: dx, y: dy };
-        self.player.pos = dest;
+        let dest = self.entities[0].pos + Vec2 { x: dx, y: dy };
+        self.entities[0].pos = dest;
         let mut rng = rand::thread_rng();
-        for enemy in self.enemies.iter_mut() {
+        for enemy in self.entities[1..].iter_mut() {
             if rng.gen_bool(0.05) {
                 enemy.dir = match rng.gen_range(0..4) {
                     0 => Dir::N,
@@ -369,16 +361,21 @@ impl Game {
                     _ => panic!(),
                 };
             }
-            enemy.pos += enemy.dir.to_vec2() * ENEMY_SPEED * dt;
+            enemy.pos += enemy.dir.to_vec2() * ENEMY_SPEED * DT;
         }
         // ----
-        // TODO POINT: implement collision detection here. for collision with the tilemap, you can use Level::tiles_within to find the tiles touching a rectangle, and filter out the ones that are not solid.  Then you have rects you can test against your player/enemies.
+        // TODO POINT: implement collision detection here.
+        // first, get a rectangle for each entity.  You can use iter() and map() for this, along with Entity::rect.
+        // next, make either one Contact struct (with a_index, a_rectangle, b_index, b_rectangle, and overlap fields) or two structs (LevelContact with a_index, b_rectangle, overlap, and EntContact with a_index, b_index, overlap).
+        // then, write a function to get contacts between a slice of rectangles and a level.  for collision of each rect with the tilemap, you can use Level::tiles_within to find the tiles touching that rectangle, and filter out the ones that are not solid. print out how many contacts you have and make sure it seems right.
+        // then, write a function to get contacts between two slices of entities, or to check all entity-entity contacts.  print out the results and make sure they make sense.
+        // next, write your collision response versus the level code (per the pseudocode on miro); it's probably a good idea to write a get_displacement(rect_a, rect_b) function to find the right offset, and add that directly to the entity involved in the collision.
+        // finally, implement your collision event handling for entity-entity collisions (harming the player, defeating enemies, etc).
         // TODO POINT: damage and knock back the player (you can use knockback_timer & health fields of game; you want the player to be invulnerable temporarily after hitting an enemy, so just decreasing health on its own won't work!)
         // TODO POINT: damage/destroy the enemy
 
-        // I suggest gathering player-tile collisions and enemy-tile collisions, then doing collision response on those sets of contacts (it's OK to use two sets of contacts).
-        // You could have helper functions like gather_contacts_tiles(&[rect], &Level, &mut Vec<Contact>) and gather_contacts(&[rect], &[rect], &mut Vec<Contact>) or do_collision_response(&[Contact], &mut [rect], &[rect]) or compute_displacement(rect, rect) -> Vec2.
-        // A Contact struct is not strictly necessary but it's a good idea (with fields like displacement, a_index, a_rect, b_index, and b_rect fields).
+        // You could have helper functions like gather_contacts(&[rect], &[rect], &mut contacts_vec) or do_collision_response(&contacts, &mut group_a, &group_b) or compute_displacement(rect, rect) -> Vec2.
+        // A Contact struct is a good idea (with displacement, a_index, a_rect, b_index, and b_rect fields).
         // Then, you can check for contacts between the player & their attack rectangle on one side, and the enemies on the other side (you can reuse gather_contacts for this).  These don't need to participate in collision response, but you can use them to determine whether the player or enemy should be damaged.
 
         // For deleting enemies, it's best to add the enemy to a "to_remove" vec, and then remove those enemies after this loop is all done.
